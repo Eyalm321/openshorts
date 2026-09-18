@@ -1602,6 +1602,21 @@ def _run_gemini_stage(client, model_name, prompt, schema):
             time.sleep(wait)
 
 
+def score_concurrency():
+    """How many scoring batches may be in flight at once.
+
+    Against a remote gateway this loop is wall-clock dominated by round trips,
+    not by anything on this machine: a 108-minute transcript is ~9 sequential
+    calls with the GPU sitting idle between them. The batches are independent,
+    so they can overlap. Gemini stays at 1 by default because Google's
+    per-minute quotas punish fan-out, and that is upstream's tested behaviour.
+    """
+    try:
+        return max(1, int(os.environ.get("LLM_SCORE_CONCURRENCY", "")))
+    except ValueError:
+        return 4 if llm_backend.active() else 1
+
+
 def _run_stage_split(client, model_name, items, build_prompt, schema, key, costs, label):
     """Run a Gemini stage over ``items``; on a policy block, bisect.
 
@@ -1699,10 +1714,44 @@ def get_viral_clips(transcript_result, video_duration):
                 video_duration=video_duration, language=language,
                 windows_json=json.dumps(_payload(ws), ensure_ascii=False))
 
-        for b in range(0, len(windows), SCORE_BATCH):
-            scored.extend(_run_stage_split(
-                client, model_name, windows[b:b + SCORE_BATCH], _score_prompt,
-                gemini_worker.ScoreResponse, "windows", costs, "score"))
+        batches = [windows[b:b + SCORE_BATCH]
+                   for b in range(0, len(windows), SCORE_BATCH)]
+
+        def _score_batch(ws):
+            return _run_stage_split(client, model_name, ws, _score_prompt,
+                                    gemini_worker.ScoreResponse, "windows",
+                                    costs, "score")
+
+        import decisions_backend
+        if decisions_backend.active():
+            # Pass 1 is a closed question, so it can go to a decisions
+            # model: ~0.3s per window instead of tens of seconds per
+            # batch of a reasoning model. Pass 2 below is generative and
+            # stays where it is. A failure here is not fatal - fall back
+            # to the chat path rather than shortlist from noise.
+            print(f"   \u26a1 Scoring {len(windows)} windows on "
+                  f"{decisions_backend.model_name()}...")
+            try:
+                scored = decisions_backend.score_windows(windows, costs)
+            except Exception as e:
+                print(f"   \u26a0\ufe0f Decisions scoring failed ({e}); "
+                      f"falling back to {model_name}.")
+                scored = []
+
+        workers = min(score_concurrency(), len(batches))
+        if scored:
+            pass  # decisions backend already produced the scores
+        elif workers > 1:
+            # pool.map keeps input order, so the shortlist is the same whichever
+            # batch answers first. costs.append is atomic under the GIL and each
+            # call builds its own httpx client, so no lock is needed here.
+            print(f"   \u26a1 Scoring {len(batches)} batches, {workers} in flight...")
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                for part in pool.map(_score_batch, batches):
+                    scored.extend(part)
+        else:
+            for ws in batches:
+                scored.extend(_score_batch(ws))
 
         # Shortlist the top windows; scale with duration so long videos surface
         # more candidates without exploding the detail call.
