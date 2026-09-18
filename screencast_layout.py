@@ -41,6 +41,11 @@ ENABLED = os.environ.get("SCREENCAST_LAYOUT", "0") == "1"
 # near 1.0. This is the axis the previous attempt did not ask about.
 MIN_WIDTH_FRACTION = 0.5
 
+# Frames the OpenAI-compatible path samples. Higher than the layout picker's 12
+# because this stage has to locate ranges along the timeline rather than answer
+# one question about the video as a whole; resolution in time is the whole job.
+FRAME_SAMPLES = int(os.environ.get("SCREENCAST_SAMPLE_FRAMES", "24"))
+
 # Above this the content fills the frame, so any presenter is composited ON TOP
 # of it rather than sitting beside it. Stacking then shows the same content
 # twice: measured on an Excel walkthrough where the speaker is keyed into the
@@ -172,9 +177,13 @@ def detect_content_ranges(video_path, video_duration):
     """
     if not ENABLED:
         return []
+    import vision_backend
     api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
+    if not api_key and not vision_backend.active():
         return []
+
+    if vision_backend.active():
+        return _content_ranges_from_frames(video_path, video_duration)
 
     from google import genai
     from google.genai import types as genai_types
@@ -229,6 +238,11 @@ def detect_content_ranges(video_path, video_duration):
                 print(f"   ⚠️ Could not delete the uploaded source from Gemini "
                       f"Files ({e}) — it expires there in 48 h.")
 
+    return _normalize_ranges(raw, video_duration)
+
+
+def _normalize_ranges(raw, video_duration):
+    """Clamp, gate and sort the model's raw ranges. Shared by both backends."""
     ranges = []
     for r in raw:
         try:
@@ -250,6 +264,47 @@ def detect_content_ranges(video_path, video_duration):
     else:
         print("   ✅ No full-width content — routing unchanged.")
     return ranges
+
+
+def _content_ranges_from_frames(video_path, video_duration):
+    """``detect_content_ranges`` against an OpenAI-compatible vision server.
+
+    Samples timestamped frames instead of uploading the source. That is a
+    strictly better privacy position than the Gemini path this replaces - no
+    copy of the user's video leaves the machine at all, only stills - and it is
+    the only shape an OpenAI-compatible endpoint accepts, since none of them
+    have a Files API.
+
+    Never raises: same contract as the caller.
+    """
+    import gemini_worker
+    import layout_picker
+    import vision_backend
+
+    print("   🔎 Checking full-width on-screen content (frames)…")
+    try:
+        timed = layout_picker.sample_frames_timed(video_path, video_duration,
+                                                  n=FRAME_SAMPLES)
+        if not timed:
+            print("   ⚠️ No readable frames — keeping face-only routing.")
+            return []
+        stamps = ", ".join(f"{t:g}s" for t, _ in timed)
+        prompt = (
+            gemini_worker.WIDE_CONTENT_PROMPT_TEMPLATE.format(
+                video_duration=video_duration)
+            + f"\n\nYou are given {len(timed)} still frames sampled from the video, "
+              f"in order, at these timestamps: {stamps}. Judge only from them and "
+              f"report ranges in seconds on the video's own clock. A range may span "
+              f"consecutive frames that look the same."
+        )
+        answer, _ = vision_backend.generate_json(
+            prompt, [b for _, b in timed], gemini_worker.WideContentResponse)
+        raw = (answer or {}).get("ranges") or []
+    except Exception as e:
+        print(f"   ⚠️ On-screen check failed ({e}) — keeping face-only routing.")
+        return []
+
+    return _normalize_ranges(raw, video_duration)
 
 
 def detect_screencast_scenes(video_path, scenes, strategies, ranges, samples=6):

@@ -128,6 +128,47 @@ def sample_frames(video_path, n=None, width=None):
     return out
 
 
+def sample_frames_timed(video_path, duration, n=None, width=None):
+    """``(timestamp_seconds, jpeg_bytes)`` for ``n`` frames spread evenly.
+
+    The stages that used to hand Gemini the whole file need to answer in time
+    ranges, so they need to know *when* each frame is. Same sampling as
+    ``sample_frames``; only the timestamp comes back alongside.
+    """
+    import cv2
+
+    n = n or SAMPLE_FRAMES
+    width = width or SAMPLE_WIDTH
+    cap = cv2.VideoCapture(video_path)
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps = cap.get(cv2.CAP_PROP_FPS) or 0
+    out = []
+    try:
+        if total <= 0:
+            return out
+        for i in range(n):
+            index = int(i * total / n)
+            cap.set(cv2.CAP_PROP_POS_FRAMES, index)
+            ok, frame = cap.read()
+            if not ok:
+                continue
+            # Prefer the container's own clock; fall back to frame index over
+            # fps, then to an even split of the known duration.
+            ts = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
+            if ts <= 0:
+                ts = index / fps if fps > 0 else (i * float(duration or 0) / n)
+            h, w = frame.shape[:2]
+            scaled = cv2.resize(frame, (width, max(2, int(h * width / w))),
+                                interpolation=cv2.INTER_AREA)
+            ok, buf = cv2.imencode(".jpg", scaled,
+                                   [cv2.IMWRITE_JPEG_QUALITY, 80])
+            if ok:
+                out.append((round(ts, 2), buf.tobytes()))
+    finally:
+        cap.release()
+    return out
+
+
 def pick(video_path, video_duration):
     """The layout Gemini picks for this video, or "none" on any failure.
 
@@ -136,8 +177,9 @@ def pick(video_path, video_duration):
     """
     if not ENABLED:
         return "none"
+    import vision_backend
     api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
+    if not api_key and not vision_backend.active():
         return "none"
 
     model_name = os.environ.get("GEMINI_MODEL") or 'gemini-3.1-flash-lite'
@@ -145,8 +187,6 @@ def pick(video_path, video_duration):
     try:
         # Inside the try on purpose: the contract above is that this never
         # raises, and an unimportable SDK is just one more reason to fall back.
-        from google import genai
-        from google.genai import types as genai_types
         import gemini_worker
 
         frames = sample_frames(video_path)
@@ -154,18 +194,27 @@ def pick(video_path, video_duration):
             print("   ⚠️ No readable frames — keeping the default layout.")
             return "none"
 
-        client = genai.Client(api_key=api_key)
-        parts = [genai_types.Part.from_bytes(data=b, mime_type="image/jpeg")
-                 for b in frames]
-        response = client.models.generate_content(
-            model=model_name,
-            contents=parts + [gemini_worker.LAYOUT_CHOICE_PROMPT],
-            config=genai_types.GenerateContentConfig(
-                response_mime_type="application/json",
-                response_schema=gemini_worker.LayoutChoice,
-            ))
-        gemini_worker.raise_if_blocked(response)
-        answer = json.loads(response.text) or {}
+        if vision_backend.active():
+            # The OpenAI-compatible path takes the same frames; only the
+            # envelope differs, so the answer parses identically below.
+            answer, _ = vision_backend.generate_json(
+                gemini_worker.LAYOUT_CHOICE_PROMPT, frames, gemini_worker.LayoutChoice)
+        else:
+            from google import genai
+            from google.genai import types as genai_types
+
+            client = genai.Client(api_key=api_key)
+            parts = [genai_types.Part.from_bytes(data=b, mime_type="image/jpeg")
+                     for b in frames]
+            response = client.models.generate_content(
+                model=model_name,
+                contents=parts + [gemini_worker.LAYOUT_CHOICE_PROMPT],
+                config=genai_types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=gemini_worker.LayoutChoice,
+                ))
+            gemini_worker.raise_if_blocked(response)
+            answer = json.loads(response.text) or {}
     except Exception as e:
         print(f"   ⚠️ Layout choice failed ({e}) — keeping the default layout.")
         return "none"
