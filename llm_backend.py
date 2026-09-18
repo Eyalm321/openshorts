@@ -99,6 +99,35 @@ def _is_format_rejection(resp: httpx.Response) -> bool:
         or "format" in body
 
 
+def cost_from_usage(usage: dict, model: str) -> dict:
+    """The ``cost_analysis`` dict, using the server's own numbers when it has them.
+
+    This module used to hard-code zero and ``local: True``, which was right for
+    Ollama and wrong the moment anyone pointed it at a paid gateway: OpenRouter
+    bills real money and the pipeline reported none. OpenRouter returns ``cost``
+    (and a prompt/completion split under ``cost_details``) on every completion,
+    so we take it at face value; servers that report nothing keep the zeros they
+    have earned.
+    """
+    details = usage.get("cost_details") or {}
+    total = float(usage.get("cost") or 0.0)
+    thinking = (usage.get("completion_tokens_details") or {}).get("reasoning_tokens")
+    return {
+        "input_tokens": int(usage.get("prompt_tokens") or 0),
+        "output_tokens": int(usage.get("completion_tokens") or 0),
+        "thinking_tokens": int(thinking or 0),
+        "input_cost": float(details.get("upstream_inference_prompt_cost") or 0.0),
+        "output_cost": float(details.get("upstream_inference_completions_cost") or 0.0),
+        "total_cost": total,
+        "model": model,
+        "price_estimated": False,
+        # "local" has always meant "this cost you nothing". Deciding it from
+        # the reported charge beats guessing from the hostname, which gets a
+        # LAN Ollama at 192.168.x.x wrong.
+        "local": total == 0.0,
+    }
+
+
 def generate_json(prompt: str, schema: Type[BaseModel], model: Optional[str] = None,
                   ) -> Tuple[dict, Optional[dict]]:
     """One chat completion that must come back as JSON matching ``schema``.
@@ -150,16 +179,5 @@ def generate_json(prompt: str, schema: Type[BaseModel], model: Optional[str] = N
     # (retried by the caller) instead of deep inside the clip pipeline.
     validated = schema.model_validate(parsed).model_dump()
 
-    usage = data.get("usage") or {}
-    cost = {
-        "input_tokens": int(usage.get("prompt_tokens") or 0),
-        "output_tokens": int(usage.get("completion_tokens") or 0),
-        "thinking_tokens": 0,
-        "input_cost": 0.0,
-        "output_cost": 0.0,
-        "total_cost": 0.0,
-        "model": model,
-        "price_estimated": False,
-        "local": True,
-    }
+    cost = cost_from_usage(data.get("usage") or {}, model)
     return validated, cost

@@ -104,16 +104,5 @@ def generate_json(prompt: str, frames: Sequence[bytes], schema: Type[BaseModel],
     parsed = gemini_worker._parse_json_response_text(text)
     validated = schema.model_validate(parsed).model_dump()
 
-    usage = data.get("usage") or {}
-    cost = {
-        "input_tokens": int(usage.get("prompt_tokens") or 0),
-        "output_tokens": int(usage.get("completion_tokens") or 0),
-        "thinking_tokens": 0,
-        "input_cost": 0.0,
-        "output_cost": 0.0,
-        "total_cost": 0.0,
-        "model": model,
-        "price_estimated": False,
-        "local": True,
-    }
+    cost = llm_backend.cost_from_usage(data.get("usage") or {}, model)
     return validated, cost

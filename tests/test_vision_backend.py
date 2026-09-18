@@ -213,3 +213,54 @@ def test_screencast_never_uploads_the_source_on_this_path(local, monkeypatch):
 
     monkeypatch.setattr("google.genai.Client", explode)
     assert screencast_layout.detect_content_ranges("/video.mp4", 30) == []
+
+
+# --- cost accounting ------------------------------------------------------
+
+def test_a_paid_gateway_reports_its_real_cost(local, monkeypatch):
+    """OpenRouter bills real money; reporting zero was the old bug."""
+    usage = {
+        "prompt_tokens": 1924, "completion_tokens": 82,
+        "cost": 0.0006756,
+        "cost_details": {"upstream_inference_prompt_cost": 0.0005772,
+                         "upstream_inference_completions_cost": 0.0000984},
+        "completion_tokens_details": {"reasoning_tokens": 49},
+    }
+    _serve(lambda r: _completion(LAYOUT_ANSWER, usage=usage), monkeypatch)
+    _, cost = vision_backend.generate_json("p", [b"f"], gemini_worker.LayoutChoice)
+    assert cost["total_cost"] == 0.0006756
+    assert cost["input_cost"] == 0.0005772
+    assert cost["output_cost"] == 0.0000984
+    assert cost["thinking_tokens"] == 49
+    assert cost["local"] is False
+
+
+def test_a_free_server_still_reports_zero(local, monkeypatch):
+    # Ollama and friends send no cost field; zero is the truthful answer.
+    _serve(lambda r: _completion(LAYOUT_ANSWER,
+                                 usage={"prompt_tokens": 10, "completion_tokens": 2}),
+           monkeypatch)
+    _, cost = vision_backend.generate_json("p", [b"f"], gemini_worker.LayoutChoice)
+    assert cost["total_cost"] == 0.0
+    assert cost["local"] is True
+
+
+# --- routing: hook grounding ----------------------------------------------
+
+def test_hook_grounding_routes_to_the_vision_server(local, monkeypatch):
+    """Without this the pipeline silently kept the ungrounded transcript hook."""
+    import hook_grounding
+
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.setattr(hook_grounding, "frames_at", lambda *a, **k: [b"f1", b"f2"])
+    monkeypatch.setattr(hook_grounding, "sample_times", lambda *a, **k: [1.0, 2.0])
+    _serve(lambda r: _completion({"on_screen": "a bunny mid-leap",
+                                  "viral_hook_text": "grounded hook",
+                                  "video_title_for_youtube_short": "grounded title"}),
+           monkeypatch)
+
+    clip = {"viral_hook_text": "old hook",
+            "video_title_for_youtube_short": "old title"}
+    out = hook_grounding.reground("/clip.mp4", clip, {"language": "en"}, 0, 30)
+    assert out is not None
+    assert clip["viral_hook_text"] == "grounded hook"
