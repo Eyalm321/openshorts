@@ -96,6 +96,51 @@ _whisper_lock = threading.Lock()
 _whisper_force_cpu = False
 
 
+_CUDA_PRELOADED = False
+
+
+def _preload_cuda_libs():
+    """Make the pip-installed CUDA runtime visible to ctranslate2.
+
+    ctranslate2 dlopens libcublas/libcudnn by bare soname, which only resolves
+    if the loader already knows where they live. The nvidia wheels drop them in
+    site-packages/nvidia/*/lib, which is on no search path, so a perfectly good
+    GPU box dies with "libcublas.so.12 not found" unless LD_LIBRARY_PATH was
+    set before the process started - too late for us to fix from in here, which
+    is why the Dockerfile bakes it into ENV.
+
+    Loading them RTLD_GLOBAL puts them in the process ahead of that dlopen, so
+    a plain `python main.py` works on a pip install with no wrapper script.
+
+    Worth knowing: torch ships CUDA 13 (libcublas.so.13) while ctranslate2 wants
+    CUDA 12, so the cu12 wheels have to be installed alongside; they coexist
+    fine. Best-effort throughout - anything missing just leaves the old
+    behaviour, and the CUDA-error fallback to CPU still covers it.
+    """
+    global _CUDA_PRELOADED
+    if _CUDA_PRELOADED:
+        return
+    _CUDA_PRELOADED = True
+    import ctypes
+    import glob as _glob
+    import site
+
+    roots = list(site.getsitepackages())
+    user = site.getusersitepackages()
+    if isinstance(user, str):
+        roots.append(user)
+    # cublasLt before cublas: the latter needs the former already resolved.
+    for pattern in ("nvidia/*/lib/libcublasLt.so.12",
+                    "nvidia/*/lib/libcublas.so.12",
+                    "nvidia/*/lib/libcudnn*.so.9"):
+        for root in roots:
+            for path in sorted(_glob.glob(os.path.join(root, pattern))):
+                try:
+                    ctypes.CDLL(path, mode=ctypes.RTLD_GLOBAL)
+                except OSError:
+                    pass
+
+
 def _get_whisper_model():
     """Process-wide WhisperModel singleton, rebuilt if the env config changes.
 
@@ -110,6 +155,7 @@ def _get_whisper_model():
     key = (cfg["model_size"], cfg["device"], cfg["compute_type"])
     with _whisper_lock:
         if _whisper_model is None or _whisper_key != key:
+            _preload_cuda_libs()
             from faster_whisper import WhisperModel
             _whisper_model = WhisperModel(key[0], device=key[1], compute_type=key[2])
             _whisper_key = key

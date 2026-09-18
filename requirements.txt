@@ -6,6 +6,11 @@ torchvision==0.26.0
 tqdm==4.67.3
 yt-dlp
 faster-whisper==1.2.1
+# ctranslate2 (inside faster-whisper) dlopens CUDA 12 by soname, but torch
+# 2.11 ships CUDA 13, so nothing in the tree provides libcublas.so.12 and GPU
+# transcription dies with "libcublas.so.12 not found". The cu12 runtime
+# coexists with torch's cu13; transcribe_backends._preload_cuda_libs finds it.
+nvidia-cublas-cu12
 py3langid==0.3.0
 google-genai==1.75.0
 python-dotenv==1.2.2
