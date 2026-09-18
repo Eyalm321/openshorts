@@ -164,7 +164,7 @@ Videos generated with OpenShorts AI Shorts — no camera, no studio, no actors:
 | **Social auto-publishing** | Yes | Pro only | TikTok only | Paid only | Paid only | No |
 | **Schedule uploads** | Yes | Pro only | No | Paid only | Paid only | No |
 | **Data privacy** | **Your server** | Their cloud | Their cloud | Their cloud | Their cloud | Their cloud |
-| **Works with a local LLM (Ollama)** | **Yes** | No | No | No | No | No |
+| **Works with any OpenAI-compatible LLM (Ollama, OpenRouter)** | **Yes** | No | No | No | No | No |
 
 ---
 
@@ -273,7 +273,7 @@ The backend log on the first job reports the chosen encoder and transcription de
 
 ---
 
-### 6. Run without a Google key (local LLM, optional)
+### 6. Run without a Google key (OpenAI-compatible LLM, optional)
 
 The only cloud call in the clip pipeline is the moment picker: it sends the
 transcript (never the video) to Gemini. Point it at any OpenAI-compatible
@@ -284,6 +284,12 @@ server instead and the whole pipeline stays on your box:
 LLM_BASE_URL=http://host.docker.internal:11434/v1   # Ollama on the host
 LLM_MODEL=qwen2.5:14b                                # any chat model that follows instructions
 # LLM_API_KEY=...                                    # only if your server checks one (vLLM --api-key, OpenRouter)
+# VISION_MODEL=...                                    # only if LLM_MODEL cannot read an image
+
+# Or a hosted gateway - one id covers text and frames:
+# LLM_BASE_URL=https://openrouter.ai/api/v1
+# LLM_MODEL=anthropic/claude-sonnet-5
+# LLM_API_KEY=sk-or-...
 ```
 
 Works with Ollama, LM Studio, vLLM, llama.cpp server, LocalAI and OpenRouter.
@@ -296,11 +302,16 @@ know:
   with `OLLAMA_CONTEXT_LENGTH=16384` (or set `num_ctx` in a Modelfile); raise
   `LLM_SCORE_BATCH` above 3 only if your context allows it. 7-8B models
   return valid JSON reliably, 3B ones do not.
-- **What still needs Gemini.** Anything that has to look at frames: the
-  automatic layout picker (`AUTO_LAYOUT`), the on-screen content detector
-  and silent videos (no speech to clip by). Without a Gemini key those fall
-  back to the plain face-tracking crop, and a silent video fails with a
-  message that says so. Add a key alongside `LLM_BASE_URL` and you get both.
+- **Frames go to the same endpoint.** The stages that have to *look* at the
+  video - the layout picker (`AUTO_LAYOUT`), the on-screen content detector
+  (`SCREENCAST_LAYOUT`), hook grounding, and the silent-video path (no speech
+  to clip by) - sample JPEG frames and send them as `image_url` parts, so any
+  vision-capable OpenAI-compatible model serves them. Upstream this half was
+  Gemini-only. Set `VISION_MODEL` when your text model has no eyes
+  (`llama3.1:8b`); leave it unset on OpenRouter, where one id usually does
+  both. With neither a vision endpoint nor a Gemini key these degrade as they
+  always did: face-tracking crop, ungrounded hooks, and a clear failure on
+  silent video.
 
 ## Technical Pipeline
 
